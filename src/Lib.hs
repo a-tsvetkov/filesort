@@ -14,19 +14,20 @@ import qualified Data.Vector.Algorithms.Intro as I
 
 splitFile :: Int -> String -> IO [String]
 splitFile chunkSize file = do
-  vector <- V.unsafeNew chunkSize
-  withBinaryFile file ReadMode (\handle -> readInts <$> B.hGetContents handle >>= makeChunks vector)
+  withBinaryFile file ReadMode (
+    \handle -> do
+      intStream <- (chunks chunkSize . readInts) <$> B.hGetContents handle
+      P.mapM (sortChunk chunkSize) intStream
+    )
+  where
+    chunks :: Int -> [a] -> [[a]]
+    chunks _ [] = []
+    chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
 
-makeChunks :: V.IOVector Int -> [Int] -> IO [String]
-makeChunks _ [] = return []
-makeChunks vector stream = do
-  let (chunk, rest) = splitAt (V.length vector) stream
-  chunkName <- makeChunk vector chunk
-  (chunkName:) <$> makeChunks vector rest
-
-makeChunk :: V.IOVector Int -> [Int] -> IO (String)
-makeChunk vector list = do
-  filled <- readVector vector list
+sortChunk :: Int -> [Int] -> IO String
+sortChunk size chunk = do
+  vector <- V.unsafeNew size
+  filled <- readVector vector chunk
   I.sort filled
   (chunkName, chunkHandle) <- openBinaryTempFile "." $ "chunk.tmp"
   writeVector filled chunkHandle
