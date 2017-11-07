@@ -6,27 +6,15 @@ import System.IO
 import System.Directory
 import Data.Maybe
 import Control.Monad
-import qualified Control.Monad.Parallel as P
+import Control.Concurrent
+import Control.Concurrent.Async
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Vector.Unboxed.Mutable as V
 import qualified Data.Vector.Algorithms.Intro as I
 
 
-splitFile :: Int -> String -> IO [String]
-splitFile chunkSize file = do
-  withBinaryFile file ReadMode (
-    \handle -> do
-      intStream <- (chunks chunkSize . readInts) <$> B.hGetContents handle
-      P.mapM (sortChunk chunkSize) intStream
-    )
-  where
-    chunks :: Int -> [a] -> [[a]]
-    chunks _ [] = []
-    chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
-
-sortChunk :: Int -> [Int] -> IO String
-sortChunk size chunk = do
-  vector <- V.unsafeNew size
+sortChunk :: V.IOVector Int -> [Int] -> IO String
+sortChunk vector chunk = do
   filled <- readVector vector chunk
   I.sort filled
   (chunkName, chunkHandle) <- openBinaryTempFile "." $ "chunk.tmp"
@@ -74,19 +62,40 @@ mergeFiles a b = do
       | xh > yh = yh:merge x yt
       | otherwise = xh:merge y xt
 
-mergeChunks :: [String] -> IO String
-mergeChunks [x] = return x
-mergeChunks files = P.forM (pairs files) (
-  \pair ->
-    case pair of
-      (a, "") -> return a
-      (a, b) -> mergeFiles a b
-  ) >>= mergeChunks
+sortWorker :: Int -> MVar [Int] -> MVar [String] -> IO ()
+sortWorker chunkSize streamMV filesMV = do
+  vector <- V.unsafeNew chunkSize
+  makeChunks streamMV filesMV vector
   where
-    pairs :: [String] -> [(String, String)]
-    pairs (a:b:rest) = (a, b):pairs rest
-    pairs (a:[]) = [(a, "")]
-    pairs [] = []
+    makeChunks :: MVar [Int] ->  MVar [String] -> V.IOVector Int -> IO ()
+    makeChunks smv fmv vector = do
+      stream <- takeMVar smv
+      let (chunk, rest) = splitAt (V.length vector) stream
+      putMVar smv rest
+      case chunk of
+        [] -> return ()
+        c -> do
+          file <- sortChunk vector c
+          modifyMVar_ fmv (\files -> return (file:files))
+          makeChunks streamMV fmv vector
+
+mergeWorker :: MVar [String] -> IO ()
+mergeWorker filesMV = do
+  files <- takeMVar filesMV
+  case files of
+    (a:b:rest) -> do
+      putMVar filesMV rest
+      result <- mergeFiles a b
+      modifyMVar_ filesMV (\f -> return (f ++ [result]))
+      mergeWorker filesMV
+    _ -> do
+      putMVar filesMV files
+      return ()
+
+worker :: Int -> MVar [Int] -> MVar [String] -> IO ()
+worker chunkSize streamMV filesMV = do
+  sortWorker chunkSize streamMV filesMV
+  mergeWorker filesMV
 
 readInts :: B.ByteString -> [Int]
 readInts = mapMaybe (fmap (fst) . B.readInt) . B.words
@@ -96,6 +105,15 @@ writeInts = B.unwords . map (B.pack . show)
 
 fileSort :: Int -> String -> String -> IO ()
 fileSort chunkSize inFile outFile = do
-  sortedChunks <- splitFile chunkSize inFile
-  finalFile <- mergeChunks sortedChunks
+  cores <- getNumCapabilities
+  finalFile <- withBinaryFile inFile ReadMode (
+    \handle -> do
+      results <- newMVar []
+      intStream <- readInts <$> B.hGetContents handle >>= newMVar
+      asyncs <- replicateM (cores-1) $ asyncBound $ worker chunkSize intStream results
+      worker chunkSize intStream results
+      mapM_ wait asyncs
+      (result:_) <- takeMVar results
+      return result
+    )
   renameFile finalFile outFile
