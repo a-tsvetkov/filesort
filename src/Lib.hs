@@ -6,6 +6,7 @@ import System.IO
 import System.Directory
 import Data.Maybe
 import Control.Monad
+import qualified Control.Monad.Parallel as P
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Vector.Unboxed.Mutable as V
 import qualified Data.Vector.Algorithms.Intro as I
@@ -74,13 +75,17 @@ mergeFiles a b = do
 
 mergeChunks :: [String] -> IO String
 mergeChunks [x] = return x
-mergeChunks x = mergeOnce x >>= mergeChunks
+mergeChunks files = P.forM (pairs files) (
+  \pair ->
+    case pair of
+      (a, "") -> return a
+      (a, b) -> mergeFiles a b
+  ) >>= mergeChunks
   where
-    mergeOnce :: [String] -> IO [String]
-    mergeOnce (a:b:rest) = do
-      newFile <- mergeFiles a b
-      (newFile:) <$> mergeOnce rest
-    mergeOnce a = return a
+    pairs :: [String] -> [(String, String)]
+    pairs (a:b:rest) = (a, b):pairs rest
+    pairs (a:[]) = [(a, "")]
+    pairs [] = []
 
 readInts :: B.ByteString -> [Int]
 readInts = mapMaybe (fmap (fst) . B.readInt) . B.words
