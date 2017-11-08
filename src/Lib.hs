@@ -5,40 +5,56 @@ module Lib
 import System.IO
 import System.Directory
 import Data.Maybe
+import Data.Char (isSpace)
+import Data.List (intersperse)
 import Control.Monad
 import Control.Concurrent
 import Control.Concurrent.Async
+import Data.ByteString.Builder
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Vector.Unboxed.Mutable as V
 import qualified Data.Vector.Algorithms.Intro as I
 
 
-sortChunk :: V.IOVector Int -> [Int] -> IO String
-sortChunk vector chunk = do
-  filled <- readVector vector chunk
-  I.sort filled
+sortChunk :: V.IOVector Int -> IO String
+sortChunk vector = do
+  I.sort vector
   (chunkName, chunkHandle) <- openBinaryTempFile "." $ "chunk.tmp"
-  writeVector filled chunkHandle
+  writeVector vector chunkHandle
   hClose chunkHandle
   return chunkName
 
-readVector :: V.IOVector Int -> [Int] -> IO (V.IOVector Int)
-readVector vector list = do
-  count <- foldM (
-    \idx value -> do
-      V.unsafeWrite vector idx value
-      return (idx + 1)
-    ) 0 list
+readVector :: V.IOVector Int -> B.ByteString -> IO (V.IOVector Int, B.ByteString)
+readVector vector stream = do
+  (count, rest) <- readValue 0 vector stream
   let sliced = if count < V.length vector then V.take count vector else vector
-  return sliced
+  return (sliced, rest)
+  where
+    readValue :: Int -> V.IOVector Int ->  B.ByteString -> IO (Int, B.ByteString)
+    readValue idx v bs
+      | idx >= V.length v = return (idx, bs)
+      | otherwise =
+          case B.readInt $ B.dropWhile (isSpace) bs of
+            Just (value, rest) -> do
+              V.unsafeWrite vector idx value
+              readValue (idx+1) v rest
+            Nothing -> return (idx, bs)
 
 writeVector :: V.IOVector Int -> Handle -> IO ()
-writeVector vector handle =
-  forM_ [0..(V.length vector - 1)] (
-  \index -> do
-    item <- V.unsafeRead vector index
-    hPutStr handle $ show item ++ " "
-  )
+writeVector vector handle = do
+  let chunkSize = 512
+  forM_ (chunks chunkSize [0..V.length vector - 1]) (
+    \idxs -> do
+      values <- mapM (V.unsafeRead vector) idxs
+      B.hPutStr handle $ toLazyByteString $ listBuilder values
+    )
+  where
+    chunks :: Int -> [a] -> [[a]]
+    chunks _ [] = []
+    chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
+
+listBuilder :: [Int] -> Builder
+listBuilder lst = mconcat $ intersperse (charUtf8 ' ') $ map (\v -> intDec v) lst
 
 mergeFiles :: String -> String -> IO String
 mergeFiles a b = do
@@ -62,20 +78,20 @@ mergeFiles a b = do
       | xh > yh = yh:merge x yt
       | otherwise = xh:merge y xt
 
-sortWorker :: Int -> MVar [Int] -> MVar [String] -> IO ()
+sortWorker :: Int -> MVar B.ByteString -> MVar [String] -> IO ()
 sortWorker chunkSize streamMV filesMV = do
   vector <- V.unsafeNew chunkSize
   sortChunks streamMV filesMV vector
   where
-    sortChunks :: MVar [Int] ->  MVar [String] -> V.IOVector Int -> IO ()
+    sortChunks :: MVar B.ByteString ->  MVar [String] -> V.IOVector Int -> IO ()
     sortChunks smv fmv vector = do
       stream <- takeMVar smv
-      let (chunk, rest) = splitAt (V.length vector) stream
+      (sliced, rest) <- readVector vector stream
       putMVar smv rest
-      case chunk of
-        [] -> return ()
-        c -> do
-          file <- sortChunk vector c
+      if V.length sliced == 0
+        then return ()
+        else do
+          file <- sortChunk sliced
           modifyMVar_ fmv (\files -> return (file:files))
           sortChunks streamMV fmv vector
 
@@ -92,7 +108,7 @@ mergeWorker filesMV = do
       putMVar filesMV files
       return ()
 
-worker :: Int -> MVar [Int] -> MVar [String] -> IO ()
+worker :: Int -> MVar B.ByteString -> MVar [String] -> IO ()
 worker chunkSize streamMV filesMV = do
   sortWorker chunkSize streamMV filesMV
   mergeWorker filesMV
@@ -101,7 +117,7 @@ readInts :: B.ByteString -> [Int]
 readInts = mapMaybe (fmap (fst) . B.readInt) . B.words
 
 writeInts :: [Int] -> B.ByteString
-writeInts = B.unwords . map (B.pack . show)
+writeInts = toLazyByteString . listBuilder
 
 fileSort :: Int -> String -> String -> IO ()
 fileSort chunkSize inFile outFile = do
@@ -109,7 +125,7 @@ fileSort chunkSize inFile outFile = do
   finalFile <- withBinaryFile inFile ReadMode (
     \handle -> do
       results <- newMVar []
-      intStream <- readInts <$> B.hGetContents handle >>= newMVar
+      intStream <- B.hGetContents handle >>= newMVar
       asyncs <- replicateM (cores-1) $ asyncBound $ worker chunkSize intStream results
       worker chunkSize intStream results
       mapM_ wait asyncs
