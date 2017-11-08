@@ -46,15 +46,12 @@ writeVector vector handle = do
   forM_ (chunks chunkSize [0..V.length vector - 1]) (
     \idxs -> do
       values <- mapM (V.unsafeRead vector) idxs
-      B.hPutStr handle $ toLazyByteString $ listBuilder values
+      B.hPutStr handle $ writeInts values
     )
   where
     chunks :: Int -> [a] -> [[a]]
     chunks _ [] = []
     chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
-
-listBuilder :: [Int] -> Builder
-listBuilder lst = mconcat $ intersperse (charUtf8 ' ') $ map (\v -> intDec v) lst
 
 mergeFiles :: String -> String -> IO String
 mergeFiles a b = do
@@ -118,6 +115,10 @@ readInts = mapMaybe (fmap (fst) . B.readInt) . B.words
 
 writeInts :: [Int] -> B.ByteString
 writeInts = toLazyByteString . listBuilder
+  where
+    listBuilder :: [Int] -> Builder
+    listBuilder lst = mconcat $ intersperse (charUtf8 ' ') $ map (\v -> intDec v) lst
+
 
 fileSort :: Int -> String -> String -> IO ()
 fileSort chunkSize inFile outFile = do
