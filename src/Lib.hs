@@ -65,10 +65,10 @@ mergeFiles a b = do
 sortWorker :: Int -> MVar [Int] -> MVar [String] -> IO ()
 sortWorker chunkSize streamMV filesMV = do
   vector <- V.unsafeNew chunkSize
-  makeChunks streamMV filesMV vector
+  sortChunks streamMV filesMV vector
   where
-    makeChunks :: MVar [Int] ->  MVar [String] -> V.IOVector Int -> IO ()
-    makeChunks smv fmv vector = do
+    sortChunks :: MVar [Int] ->  MVar [String] -> V.IOVector Int -> IO ()
+    sortChunks smv fmv vector = do
       stream <- takeMVar smv
       let (chunk, rest) = splitAt (V.length vector) stream
       putMVar smv rest
@@ -77,7 +77,7 @@ sortWorker chunkSize streamMV filesMV = do
         c -> do
           file <- sortChunk vector c
           modifyMVar_ fmv (\files -> return (file:files))
-          makeChunks streamMV fmv vector
+          sortChunks streamMV fmv vector
 
 mergeWorker :: MVar [String] -> IO ()
 mergeWorker filesMV = do
