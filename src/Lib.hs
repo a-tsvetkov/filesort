@@ -120,8 +120,7 @@ readInts = evalState readAll
     readAll = do
       value <- readInt
       case value of
-        Just v ->
-          (v:) <$> readAll
+        Just v -> (v:) <$> readAll
         Nothing -> return []
 
 readInt :: State B.ByteString (Maybe Int)
