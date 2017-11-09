@@ -4,10 +4,10 @@ module Lib
 
 import System.IO
 import System.Directory
-import Data.Maybe
 import Data.Char (isSpace)
 import Data.List (intersperse)
 import Control.Monad
+import Control.Monad.State.Lazy
 import Control.Concurrent
 import Control.Concurrent.Async
 import Data.ByteString.Builder
@@ -26,19 +26,22 @@ sortChunk vector = do
 
 readVector :: V.IOVector Int -> B.ByteString -> IO (V.IOVector Int, B.ByteString)
 readVector vector stream = do
-  (count, rest) <- readValue 0 vector stream
+  let (ints, rest) = runState (readValues $ V.length vector) stream
+  count <- foldM (
+    \idx value -> do
+      V.unsafeWrite vector idx value
+      return (idx + 1)
+    ) 0 ints
   let sliced = if count < V.length vector then V.take count vector else vector
   return (sliced, rest)
   where
-    readValue :: Int -> V.IOVector Int ->  B.ByteString -> IO (Int, B.ByteString)
-    readValue idx v bs
-      | idx >= V.length v = return (idx, bs)
-      | otherwise =
-          case B.readInt $ B.dropWhile (isSpace) bs of
-            Just (value, rest) -> do
-              V.unsafeWrite vector idx value
-              readValue (idx+1) v rest
-            Nothing -> return (idx, bs)
+    readValues :: Int -> State B.ByteString [Int]
+    readValues 0 = return []
+    readValues n = do
+      value <- readInt
+      case value of
+        Nothing -> return []
+        Just v -> (v:) <$> readValues (n-1)
 
 writeVector :: V.IOVector Int -> Handle -> IO ()
 writeVector vector handle = do
@@ -46,7 +49,7 @@ writeVector vector handle = do
   forM_ (chunks chunkSize [0..V.length vector - 1]) (
     \idxs -> do
       values <- mapM (V.unsafeRead vector) idxs
-      B.hPutStr handle $ writeInts values
+      B.hPutStr handle $ B.append (writeInts values) $ B.singleton ' '
     )
   where
     chunks :: Int -> [a] -> [[a]]
@@ -111,13 +114,31 @@ worker chunkSize streamMV filesMV = do
   mergeWorker filesMV
 
 readInts :: B.ByteString -> [Int]
-readInts = mapMaybe (fmap (fst) . B.readInt) . B.words
+readInts = evalState readAll
+  where
+    readAll :: State B.ByteString [Int]
+    readAll = do
+      value <- readInt
+      case value of
+        Just v ->
+          (v:) <$> readAll
+        Nothing -> return []
+
+readInt :: State B.ByteString (Maybe Int)
+readInt = do
+  bs <- get
+  case B.readInt $ B.dropWhile (isSpace) bs of
+    Just (value, rest) -> do
+      put rest
+      return (Just value)
+    Nothing -> return Nothing
+
 
 writeInts :: [Int] -> B.ByteString
 writeInts = toLazyByteString . listBuilder
   where
     listBuilder :: [Int] -> Builder
-    listBuilder lst = mconcat $ intersperse (charUtf8 ' ') $ map (\v -> intDec v) lst
+    listBuilder lst = mconcat $ intersperse (charUtf8 ' ') $ map intDec lst
 
 
 fileSort :: Int -> String -> String -> IO ()
