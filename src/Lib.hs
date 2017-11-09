@@ -6,6 +6,7 @@ import System.IO
 import System.Directory
 import Data.Char (isSpace)
 import Data.List (intersperse)
+import Data.Maybe (fromMaybe)
 import Control.Monad
 import Control.Monad.State.Lazy
 import Control.Concurrent
@@ -126,12 +127,9 @@ readInts = evalState readAll
 readInt :: State B.ByteString (Maybe Int)
 readInt = do
   bs <- get
-  case B.readInt $ B.dropWhile (isSpace) bs of
-    Just (value, rest) -> do
-      put rest
-      return (Just value)
-    Nothing -> return Nothing
-
+  let result = B.readInt $ B.dropWhile (isSpace) bs
+  put $ fromMaybe bs (snd <$> result)
+  return (fst <$> result)
 
 writeInts :: [Int] -> B.ByteString
 writeInts = toLazyByteString . listBuilder
