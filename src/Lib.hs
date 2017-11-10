@@ -46,7 +46,6 @@ readVector vector stream = do
 
 writeVector :: V.IOVector Int -> Handle -> IO ()
 writeVector vector handle = do
-  let chunkSize = 512
   forM_ (chunks chunkSize [0..V.length vector - 1]) (
     \idxs -> do
       values <- mapM (V.unsafeRead vector) idxs
@@ -56,6 +55,8 @@ writeVector vector handle = do
     chunks :: Int -> [a] -> [[a]]
     chunks _ [] = []
     chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
+
+    chunkSize = 512
 
 mergeFiles :: String -> String -> IO String
 mergeFiles a b = do
