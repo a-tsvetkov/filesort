@@ -6,12 +6,13 @@ import System.IO
 import System.Directory
 import Data.Char (isSpace)
 import Data.List (intersperse)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, catMaybes)
+import Data.ByteString.Builder
 import Control.Monad
 import Control.Monad.State.Lazy
 import Control.Concurrent
 import Control.Concurrent.Async
-import Data.ByteString.Builder
+import Control.Concurrent.STM
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Data.Vector.Unboxed.Mutable as V
 import qualified Data.Vector.Algorithms.Intro as I
@@ -25,16 +26,22 @@ sortChunk vector = do
   hClose chunkHandle
   return chunkName
 
-readVector :: V.IOVector Int -> B.ByteString -> IO (V.IOVector Int, B.ByteString)
+readVector :: V.IOVector Int -> TVar B.ByteString -> IO (V.IOVector Int)
 readVector vector stream = do
-  let (ints, rest) = runState (readValues $ V.length vector) stream
+  ints <- atomically (
+    do
+      st <- readTVar stream
+      let (parsed, rest) = runState (readValues $ V.length vector) st
+      writeTVar stream rest
+      return parsed
+    )
   count <- foldM (
     \idx value -> do
       V.unsafeWrite vector idx value
       return (idx + 1)
     ) 0 ints
   let sliced = if count < V.length vector then V.take count vector else vector
-  return (sliced, rest)
+  return sliced
   where
     readValues :: Int -> State B.ByteString [Int]
     readValues 0 = return []
@@ -52,11 +59,12 @@ writeVector vector handle = do
       B.hPutStr handle $ B.append (writeInts values) $ B.singleton ' '
     )
   where
+    chunkSize = 512
+
     chunks :: Int -> [a] -> [[a]]
     chunks _ [] = []
     chunks size lst = let (chunk, rest) = splitAt size lst in chunk:chunks size rest
 
-    chunkSize = 512
 
 mergeFiles :: String -> String -> IO String
 mergeFiles a b = do
@@ -80,40 +88,36 @@ mergeFiles a b = do
       | xh > yh = yh:merge x yt
       | otherwise = xh:merge y xt
 
-sortWorker :: Int -> MVar B.ByteString -> MVar [String] -> IO ()
-sortWorker chunkSize streamMV filesMV = do
+sortWorker :: Int -> TVar B.ByteString -> TQueue String -> IO ()
+sortWorker chunkSize stream files = do
   vector <- V.unsafeNew chunkSize
-  sortChunks streamMV filesMV vector
+  sortChunks stream files vector
   where
-    sortChunks :: MVar B.ByteString ->  MVar [String] -> V.IOVector Int -> IO ()
-    sortChunks smv fmv vector = do
-      stream <- takeMVar smv
-      (sliced, rest) <- readVector vector stream
-      putMVar smv rest
+    sortChunks :: TVar B.ByteString ->  TQueue String -> V.IOVector Int -> IO ()
+    sortChunks st fs vc = do
+      sliced <- readVector vc st
       if V.length sliced == 0
         then return ()
         else do
           file <- sortChunk sliced
-          modifyMVar_ fmv (\files -> return (file:files))
-          sortChunks streamMV fmv vector
+          atomically $ writeTQueue files file
+          sortChunks st fs vc
 
-mergeWorker :: MVar [String] -> IO ()
-mergeWorker filesMV = do
-  files <- takeMVar filesMV
-  case files of
-    (a:b:rest) -> do
-      putMVar filesMV rest
+mergeWorker :: TQueue String -> IO ()
+mergeWorker filesQueue = do
+  files <- atomically $ replicateM 2 $ tryReadTQueue filesQueue
+  case catMaybes files of
+    (a:b:_) -> do
       result <- mergeFiles a b
-      modifyMVar_ filesMV (\f -> return (f ++ [result]))
-      mergeWorker filesMV
-    _ -> do
-      putMVar filesMV files
-      return ()
+      atomically $ writeTQueue filesQueue result
+      mergeWorker filesQueue
+    (a:[]) -> atomically $ writeTQueue filesQueue a
+    [] -> return ()
 
-worker :: Int -> MVar B.ByteString -> MVar [String] -> IO ()
-worker chunkSize streamMV filesMV = do
-  sortWorker chunkSize streamMV filesMV
-  mergeWorker filesMV
+worker :: Int -> TVar B.ByteString -> TQueue String -> IO ()
+worker chunkSize stream files = do
+  sortWorker chunkSize stream files
+  mergeWorker files
 
 readInts :: B.ByteString -> [Int]
 readInts = evalState readAll
@@ -144,12 +148,12 @@ fileSort chunkSize inFile outFile = do
   cores <- getNumCapabilities
   finalFile <- withBinaryFile inFile ReadMode (
     \handle -> do
-      results <- newMVar []
-      intStream <- B.hGetContents handle >>= newMVar
+      results <- newTQueueIO
+      intStream <- B.hGetContents handle >>= newTVarIO
       asyncs <- replicateM (cores-1) $ asyncBound $ worker chunkSize intStream results
       worker chunkSize intStream results
       mapM_ wait asyncs
-      (result:_) <- takeMVar results
+      result <- atomically $ readTQueue results
       return result
     )
   renameFile finalFile outFile
