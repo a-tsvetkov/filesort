@@ -149,7 +149,7 @@ fileSort chunkSize inFile outFile = do
   finalFile <- withBinaryFile inFile ReadMode (
     \handle -> do
       results <- newTQueueIO
-      intStream <- B.hGetContents handle >>= newTVarIO
+      intStream <- newTVarIO =<< B.hGetContents handle
       asyncs <- replicateM (cores-1) $ asyncBound $ worker chunkSize intStream results
       worker chunkSize intStream results
       mapM_ wait asyncs
